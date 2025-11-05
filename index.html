@@ -1,0 +1,360 @@
+<!doctype html>
+<html lang="fa">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Audio Sync Finder (Offline)</title>
+<style>
+  body{font-family:system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial; padding:16px; direction:rtl; }
+  h1{font-size:20px}
+  button{padding:10px 14px; margin:8px 0; font-size:16px}
+  .box{border:1px solid #ddd; padding:12px; border-radius:8px; margin:8px 0}
+  pre{background:#f6f6f8;padding:12px;border-radius:6px;overflow:auto}
+  progress{width:100%}
+</style>
+</head>
+<body>
+  <h1>🔎 Audio Sync Finder — (آفلاین)</h1>
+  <p>این ابزار روی آیفون (Safari) اجرا می‌شود. دو فایل انتخاب کن: ویدیو (mp4/mov) و صوت (m4a). نتیجه زمان دقیق شروع صدای ویدیو در فایل بلند را تا میلی‌ثانیه می‌دهد.</p>
+
+  <div class="box">
+    <div>فایل ویدیو: <span id="videoName">هنوز انتخاب نشده</span></div>
+    <input id="videoFile" type="file" accept="video/*" />
+    <div style="height:8px"></div>
+    <div>فایل صوتی بلند: <span id="audioName">هنوز انتخاب نشده</span></div>
+    <input id="audioFile" type="file" accept="audio/*" />
+  </div>
+
+  <div>
+    <button id="analyzeBtn">Analyze (High precision)</button>
+    <button id="stopBtn" disabled>Stop</button>
+  </div>
+
+  <div class="box">
+    <div><strong>Progress</strong></div>
+    <progress id="progress" value="0" max="1"></progress>
+    <div id="status">آماده</div>
+  </div>
+
+  <div class="box">
+    <div><strong>Result</strong></div>
+    <pre id="result">هیچ تحلیلی انجام نشده</pre>
+  </div>
+
+<script>
+/*
+ Offline Audio Sync Finder (client-side JS)
+ - Coarse search via RMS envelope
+ - Refine via time-domain cross-correlation on small window
+ Notes:
+ - Downsamples input to targetSampleRate to reduce CPU
+ - Works fully in browser using Web Audio decodeAudioData
+*/
+
+const videoInput = document.getElementById('videoFile');
+const audioInput = document.getElementById('audioFile');
+const videoNameEl = document.getElementById('videoName');
+const audioNameEl = document.getElementById('audioName');
+const analyzeBtn = document.getElementById('analyzeBtn');
+const stopBtn = document.getElementById('stopBtn');
+const progressEl = document.getElementById('progress');
+const statusEl = document.getElementById('status');
+const resultEl = document.getElementById('result');
+
+let abortFlag = false;
+
+videoInput.onchange = e => {
+  const f = e.target.files[0];
+  videoNameEl.textContent = f ? f.name : 'هنوز انتخاب نشده';
+};
+audioInput.onchange = e => {
+  const f = e.target.files[0];
+  audioNameEl.textContent = f ? f.name : 'هنوز انتخاب نشده';
+};
+
+analyzeBtn.onclick = async () => {
+  if (!videoInput.files[0] || !audioInput.files[0]) {
+    alert('هر دو فایل ویدیو و صوت را انتخاب کنید.');
+    return;
+  }
+  abortFlag = false;
+  stopBtn.disabled = false;
+  analyzeBtn.disabled = true;
+  resultEl.textContent = 'شروع تحلیل...';
+  progressEl.value = 0;
+  statusEl.textContent = 'در حال بازخوانی فایل‌ها';
+  try {
+    // decode both files to float arrays
+    const audioCtx = new (window.OfflineAudioContext || window.webkitOfflineAudioContext)(1, 1, 44100);
+    const videoBuf = await decodeToMonoFloat(videoInput.files[0], audioCtx);
+    status('ویدیو دیکد شد — طول: ' + formatTime(videoBuf.length / audioCtx.sampleRate));
+    progress(0.05);
+    if (abortFlag) throw 'aborted';
+
+    const longBuf = await decodeToMonoFloat(audioInput.files[0], audioCtx);
+    status('فایل صوتی دیکد شد — طول: ' + formatTime(longBuf.length / audioCtx.sampleRate));
+    progress(0.12);
+    if (abortFlag) throw 'aborted';
+
+    // parameters
+    const targetSR = 11025; // downsample to this for coarse
+    status('Downsampling & envelope computing');
+    const short = downsampleFloat32(videoBuf, audioCtx.sampleRate, targetSR);
+    const long = downsampleFloat32(longBuf, audioCtx.sampleRate, targetSR);
+
+    progress(0.20);
+    if (abortFlag) throw 'aborted';
+
+    // compute RMS envelope
+    const frameSize = 2048; // samples for envelope
+    const hop = 512;
+    status('Computing RMS envelope (coarse search)');
+    const shortEnv = rmsEnvelope(short, frameSize, hop);
+    const longEnv = rmsEnvelope(long, frameSize, hop);
+    progress(0.35);
+
+    // normalized cross-correlation but sliding with stride to speed up
+    status('Coarse matching (searching best candidate windows)...');
+    const stride = Math.max(1, Math.floor(shortEnv.length / 2000)); // adjust to keep operations bounded
+    const candidates = coarseMatchIndices(longEnv, shortEnv, stride, 5);
+    progress(0.6);
+
+    if (candidates.length === 0) {
+      resultEl.textContent = 'هیچ هم‌خوانی معناداری پیدا نشد.';
+      resetButtons();
+      return;
+    }
+
+    status('Refining top candidates...');
+    // refine by checking original (not-downsampled) signals in small windows around candidate
+    const sampleRateOrig = audioCtx.sampleRate;
+    const downRatio = audioCtx.sampleRate / targetSR;
+    let best = {score:-Infinity, offsetSec:0};
+    let step = 0;
+    for (let ci=0; ci<candidates.length; ci++) {
+      if (abortFlag) throw 'aborted';
+      const envIdx = candidates[ci];
+      // map env index to coarse sample index
+      const approxSample = Math.max(0, Math.floor((envIdx * hop) * downRatio)); // position in original samples
+      // define refine window ±refineSec
+      const refineSec = 6.0; // +/- 6 seconds for fine search
+      const left = Math.max(0, approxSample - Math.floor(refineSec * sampleRateOrig));
+      const right = Math.min(longBuf.length, approxSample + Math.floor(refineSec * sampleRateOrig));
+      const windowLong = longBuf.subarray(left, right);
+      // use short full-resolution (video short) for cross-correlation (maybe long)
+      const shortFull = videoBuf;
+      // compute cross-correlation via time-domain on manageable sizes
+      const {lagSample, corr} = refineCrossCorrelation(windowLong, shortFull, sampleRateOrig);
+      // compute global offset = left + lagSample (in samples of original long audio)
+      const globalSample = left + lagSample;
+      const offsetSec = globalSample / sampleRateOrig;
+      if (corr > best.score) {
+        best = {score:corr, offsetSec};
+      }
+      step++;
+      progress(0.6 + 0.35*(step / candidates.length));
+    }
+
+    // display result
+    const ms = Math.round(best.offsetSec*1000); // milliseconds
+    const txt = `✅ Match found at ${formatHMSms(best.offsetSec)}\nOffset (ms): ${ms}\nCorrelation: ${best.score.toFixed(4)}`;
+    resultEl.textContent = txt;
+    status('تمام شد');
+    progress(1);
+  } catch (err) {
+    if (err === 'aborted') {
+      status('توقف شد توسط کاربر');
+      resultEl.textContent = 'تحلیل متوقف شد.';
+    } else {
+      console.error(err);
+      resultEl.textContent = 'خطا: ' + String(err);
+      status('خطا');
+    }
+  }
+  resetButtons();
+};
+
+stopBtn.onclick = () => {
+  abortFlag = true;
+  stopBtn.disabled = true;
+};
+
+function resetButtons() {
+  analyzeBtn.disabled = false;
+  stopBtn.disabled = true;
+}
+
+function status(s){ statusEl.textContent = s; }
+function progress(v){ progressEl.value = v; }
+
+// ---------- audio decode & utilities ----------
+async function decodeToMonoFloat(file, audioCtx) {
+  const arr = await file.arrayBuffer();
+  // decodeAudioData is available on AudioContext - using new AudioContext if needed
+  const actx = new (window.AudioContext || window.webkitAudioContext)();
+  const buf = await actx.decodeAudioData(arr);
+  // mixdown to mono
+  const ch = buf.numberOfChannels;
+  const len = buf.length;
+  const out = new Float32Array(len);
+  for (let c=0;c<ch;c++){
+    const data = buf.getChannelData(c);
+    for (let i=0;i<len;i++) out[i] += data[i] / ch;
+  }
+  actx.close();
+  return out;
+}
+
+function downsampleFloat32(input, srcRate, targetRate) {
+  if (srcRate === targetRate) return input;
+  const ratio = srcRate / targetRate;
+  const outLen = Math.floor(input.length / ratio);
+  const out = new Float32Array(outLen);
+  for (let i=0;i<outLen;i++){
+    // simple average over the input samples for this output sample
+    const start = Math.floor(i*ratio);
+    const end = Math.min(input.length, Math.floor((i+1)*ratio));
+    let sum = 0, count = 0;
+    for (let j=start;j<end;j++){ sum += input[j]; count++; }
+    out[i] = count ? sum / count : 0;
+  }
+  return out;
+}
+
+function rmsEnvelope(samples, frameSize=2048, hop=512) {
+  const n = Math.floor((samples.length - frameSize) / hop) + 1;
+  const env = new Float32Array(Math.max(0,n));
+  for (let i=0;i<n;i++){
+    let sum=0;
+    const start = i*hop;
+    for (let j=0;j<frameSize;j++){
+      const v = samples[start+j];
+      sum += v*v;
+    }
+    env[i] = Math.sqrt(sum / frameSize);
+  }
+  // normalize
+  let max = 0;
+  for (let i=0;i<env.length;i++) if (env[i]>max) max=env[i];
+  if (max>0) for (let i=0;i<env.length;i++) env[i] /= max;
+  return env;
+}
+
+// coarse match: sliding dot product with stride, returns top N indices
+function coarseMatchIndices(longEnv, shortEnv, stride=10, topN=5) {
+  const L = longEnv.length, S = shortEnv.length;
+  if (S >= L) return [];
+  let best = [];
+  // precompute short energy and maybe reversed?
+  let shortEnergy = 0;
+  for (let i=0;i<S;i++) shortEnergy += shortEnv[i]*shortEnv[i];
+  if (shortEnergy === 0) return [];
+  for (let pos=0; pos+S < L; pos += stride) {
+    let dot = 0;
+    let le = 0;
+    for (let j=0;j<S;j++){
+      const v = longEnv[pos+j];
+      dot += v * shortEnv[j];
+      le += v*v;
+    }
+    // normalized correlation approx
+    const denom = Math.sqrt(le*shortEnergy) + 1e-9;
+    const corr = dot / denom;
+    // keep topN
+    if (best.length < topN) best.push({pos, corr});
+    else {
+      // find min
+      let minIdx = 0;
+      for (let k=1;k<best.length;k++) if (best[k].corr < best[minIdx].corr) minIdx = k;
+      if (corr > best[minIdx].corr) best[minIdx] = {pos, corr};
+    }
+  }
+  // sort descending
+  best.sort((a,b)=>b.corr-a.corr);
+  return best.map(x=>x.pos);
+}
+
+// refine cross-correlation in time-domain
+// windowLong: Float32Array, shortFull: Float32Array
+// returns lagSample (index in windowLong where shortFull best aligns), corr (peak normalized)
+function refineCrossCorrelation(windowLong, shortFull, sampleRate) {
+  // to speed: if shortFull longer than windowLong, we truncate shortFull or require shortFull shorter.
+  const W = windowLong.length;
+  const S = shortFull.length;
+  // if short > window, take only central segment of short
+  let short = shortFull;
+  if (S > Math.floor(W*0.9)) {
+    // truncate center
+    const start = Math.max(0, Math.floor((S - Math.floor(W*0.9))/2));
+    short = shortFull.subarray(start, start + Math.floor(W*0.9));
+  }
+  const sL = short.length;
+  // compute normalized cross-correlation by sliding short over windowLong
+  let bestCorr = -Infinity;
+  let bestLag = 0;
+  // precompute energy of short
+  let energyShort = 0;
+  for (let i=0;i<sL;i++) energyShort += short[i]*short[i];
+  const eps = 1e-9;
+  // for each lag from 0..W-sL
+  const maxLag = Math.max(0, W - sL);
+  // to avoid excessive compute, limit to reasonable maxLag if huge
+  const MAX_OPERATIONS = 6e7; // safety
+  let ops = (maxLag+1) * sL;
+  let step = 1;
+  if (ops > MAX_OPERATIONS) {
+    step = Math.ceil(ops / MAX_OPERATIONS);
+  }
+  for (let lag=0; lag<=maxLag; lag+=step) {
+    let dot = 0, energyLong=0;
+    const start = lag;
+    for (let i=0;i<sL;i++){
+      const v = windowLong[start + i];
+      dot += v * short[i];
+      energyLong += v*v;
+    }
+    const denom = Math.sqrt(energyLong * energyShort) + eps;
+    const corr = dot / denom;
+    if (corr > bestCorr) {
+      bestCorr = corr;
+      bestLag = lag;
+    }
+  }
+  // if we used stepping >1, refine around bestLag with step=1
+  // refine range ±step*2
+  if (step > 1) {
+    const low = Math.max(0, bestLag - step*2);
+    const high = Math.min(maxLag, bestLag + step*2);
+    for (let lag=low; lag<=high; lag++) {
+      let dot=0, energyLong=0;
+      for (let i=0;i<sL;i++){
+        const v = windowLong[lag + i];
+        dot += v * short[i];
+        energyLong += v*v;
+      }
+      const denom = Math.sqrt(energyLong * energyShort) + eps;
+      const corr = dot / denom;
+      if (corr > bestCorr) { bestCorr = corr; bestLag = lag; }
+    }
+  }
+  return {lagSample: bestLag, corr: bestCorr};
+}
+
+// ---------- helpers ----------
+function formatHMSms(secFloat) {
+  const sign = secFloat < 0 ? '-' : '';
+  const t = Math.abs(secFloat);
+  const h = Math.floor(t/3600);
+  const m = Math.floor((t%3600)/60);
+  const s = Math.floor(t%60);
+  const ms = Math.floor((t - Math.floor(t)) * 1000);
+  return `${sign}${pad(h,2)}:${pad(m,2)}:${pad(s,2)}.${pad(ms,3)}`;
+}
+function formatTime(sec){
+  return formatHMSms(sec);
+}
+function pad(n,d){ return n.toString().padStart(d,'0'); }
+
+</script>
+</body>
+</html>
